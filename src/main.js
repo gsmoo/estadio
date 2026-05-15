@@ -2,6 +2,7 @@ import './style.css';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 
 const SEAT_STATES = {
   FREE: 0,
@@ -220,6 +221,19 @@ function fitRowPlansToTarget(rowPlans, targetSeatCount) {
   return rowPlans;
 }
 
+function getOuterSeatRadius(config) {
+  const {
+    ringCount,
+    rowsPerRing,
+    ringGapDepth,
+    rowDepth,
+    innerRadius,
+  } = config;
+
+  const lastRingOffset = (ringCount - 1) * (rowsPerRing * rowDepth + ringGapDepth);
+  return innerRadius + lastRingOffset + (rowsPerRing - 1) * rowDepth;
+}
+
 function generateStadiumLayout(config) {
   const {
     targetSeatCount,
@@ -278,10 +292,10 @@ async function loadSeatTemplate() {
     return [
       {
         geometry,
-        material: new THREE.MeshBasicMaterial({
+        material: new THREE.MeshStandardMaterial({
           color: '#ffffff',
-          vertexColors: false,
-          toneMapped: false,
+          roughness: 0.78,
+          metalness: 0.06,
         }),
       },
     ];
@@ -306,10 +320,10 @@ async function loadSeatTemplate() {
     bounds.union(geometry.boundingBox);
     geometry.computeVertexNormals();
 
-    const material = new THREE.MeshBasicMaterial({
+    const material = new THREE.MeshStandardMaterial({
       color: '#ffffff',
-      vertexColors: false,
-      toneMapped: false,
+      roughness: 0.78,
+      metalness: 0.06,
     });
 
     templateMeshes.push({
@@ -351,6 +365,7 @@ class SeatInstancedMap {
     this.templateMeshes = templateMeshes;
     this.stateMeshes = new Map();
     this.dummy = new THREE.Object3D();
+    this.instanceMatrix = new THREE.Matrix4();
     this.hoveredId = -1;
     this.selectedId = -1;
     this.hoverMarker = null;
@@ -382,7 +397,7 @@ class SeatInstancedMap {
     this.hoveredId = instanceId;
 
     if (this.hoveredId !== -1 && this.hoveredId !== this.selectedId) {
-      this.placeMarker(this.hoverMarker, instanceId, 1.08);
+      this.placeMarker(this.hoverMarker, instanceId);
     }
   }
 
@@ -394,7 +409,7 @@ class SeatInstancedMap {
       return;
     }
 
-    this.placeMarker(this.selectedMarker, instanceId, 1.14);
+    this.placeMarker(this.selectedMarker, instanceId);
   }
 
   cycleSeatState(instanceId) {
@@ -403,11 +418,11 @@ class SeatInstancedMap {
     this.rebuildStateMeshes();
 
     if (this.hoveredId !== -1 && this.hoveredId !== this.selectedId) {
-      this.placeMarker(this.hoverMarker, this.hoveredId, 1.08);
+      this.placeMarker(this.hoverMarker, this.hoveredId);
     }
 
     if (this.selectedId !== -1) {
-      this.placeMarker(this.selectedMarker, this.selectedId, 1.14);
+      this.placeMarker(this.selectedMarker, this.selectedId);
     }
 
     return nextState;
@@ -472,38 +487,74 @@ class SeatInstancedMap {
   }
 
   createMarkers() {
-    const markerGeometry = this.templateMeshes[0].geometry.clone();
+    const hoverGroup = new THREE.Group();
+    hoverGroup.matrixAutoUpdate = false;
+    hoverGroup.visible = false;
 
-    this.hoverMarker = new THREE.Mesh(
-      markerGeometry,
-      new THREE.MeshBasicMaterial({
-        color: SEAT_COLORS.hover,
-        wireframe: true,
-        toneMapped: false,
-      }),
-    );
-    this.hoverMarker.visible = false;
+    const selectedGroup = new THREE.Group();
+    selectedGroup.matrixAutoUpdate = false;
+    selectedGroup.visible = false;
+
+    for (const template of this.templateMeshes) {
+      const hoverPart = new THREE.Mesh(
+        template.geometry.clone(),
+        new THREE.MeshStandardMaterial({
+          color: SEAT_COLORS.hover,
+          roughness: 0.32,
+          metalness: 0.02,
+          emissive: SEAT_COLORS.hover.clone().multiplyScalar(0.35),
+          transparent: true,
+          opacity: 0.92,
+          depthWrite: false,
+        }),
+      );
+      hoverPart.matrixAutoUpdate = false;
+      hoverGroup.add(hoverPart);
+
+      const selectedPart = new THREE.Mesh(
+        template.geometry.clone(),
+        new THREE.MeshStandardMaterial({
+          color: SEAT_COLORS.selected,
+          roughness: 0.28,
+          metalness: 0.04,
+          emissive: SEAT_COLORS.selected.clone().multiplyScalar(0.4),
+          transparent: true,
+          opacity: 0.96,
+          depthWrite: false,
+        }),
+      );
+      selectedPart.matrixAutoUpdate = false;
+      selectedGroup.add(selectedPart);
+    }
+
+    this.hoverMarker = hoverGroup;
+    this.selectedMarker = selectedGroup;
     this.scene.add(this.hoverMarker);
-
-    this.selectedMarker = new THREE.Mesh(
-      markerGeometry.clone(),
-      new THREE.MeshBasicMaterial({
-        color: SEAT_COLORS.selected,
-        wireframe: true,
-        toneMapped: false,
-      }),
-    );
-    this.selectedMarker.visible = false;
     this.scene.add(this.selectedMarker);
   }
 
-  placeMarker(marker, instanceId, scale) {
-    const seat = this.repository.getSeat(instanceId);
+  placeMarker(marker, instanceId) {
     marker.visible = true;
-    marker.position.copy(seat.position);
-    marker.rotation.set(0, seat.rotationY, 0);
-    marker.scale.setScalar(scale);
-    marker.updateMatrix();
+
+    const state = this.repository.getState(instanceId);
+    const meshes = this.stateMeshes.get(state);
+
+    if (!meshes || meshes.length === 0) {
+      marker.visible = false;
+      return;
+    }
+
+    const mesh = meshes[0];
+    const localIndex = mesh.userData.globalIds.indexOf(instanceId);
+
+    if (localIndex === -1) {
+      marker.visible = false;
+      return;
+    }
+
+    mesh.getMatrixAt(localIndex, this.instanceMatrix);
+    marker.matrix.copy(this.instanceMatrix);
+    marker.matrixWorldNeedsUpdate = true;
   }
 
   dispose() {
@@ -533,9 +584,16 @@ function createRenderer() {
 
 function createScene() {
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color('#d7e3f4');
-  scene.fog = new THREE.Fog('#d7e3f4', 90, 250);
+  scene.fog = new THREE.Fog('#d7e3f4', 120, 320);
   return scene;
+}
+
+async function applyHdriBackground(scene) {
+  const loader = new RGBELoader();
+  const texture = await loader.loadAsync('/hdri/horn-koppe_spring_2k.hdr');
+  texture.mapping = THREE.EquirectangularReflectionMapping;
+  texture.colorSpace = THREE.LinearSRGBColorSpace;
+  scene.background = texture;
 }
 
 function createCamera() {
@@ -550,6 +608,8 @@ function createCamera() {
 }
 
 function addEnvironment(scene) {
+  const outerSeatRadius = getOuterSeatRadius(STADIUM_CONFIG);
+
   const hemiLight = new THREE.HemisphereLight('#f6fbff', '#8f9aa8', 1.65);
   scene.add(hemiLight);
 
@@ -571,7 +631,7 @@ function addEnvironment(scene) {
   scene.add(field);
 
   const fieldBorder = new THREE.Mesh(
-    new THREE.RingGeometry(26, 92, 128),
+    new THREE.RingGeometry(26, outerSeatRadius + 2.5, 256),
     new THREE.MeshStandardMaterial({
       color: '#c5ccd8',
       roughness: 1,
@@ -701,6 +761,7 @@ async function bootstrap() {
   controls.maxPolarAngle = Math.PI * 0.47;
 
   addEnvironment(scene);
+  await applyHdriBackground(scene);
 
   const layout = generateStadiumLayout(STADIUM_CONFIG);
   const repository = new SeatRepository(layout);
